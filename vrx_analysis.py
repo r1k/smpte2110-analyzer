@@ -6,6 +6,7 @@ import numpy
 import math
 import sys
 from decimal import *
+from collections import deque
 
 
 
@@ -40,46 +41,82 @@ def frame_rate(capture):
             if len(rtp_timestamp) < 3:
                 rtp_timestamp.append(int(pkt.rtp.timestamp))
             else:
-                frame_rate_c = Decimal(RTP_CLOCK /
-                    (( (rtp_timestamp[2] - rtp_timestamp[1]) % RTP_TIMESTAMP_BIT_DEPTH +
-                       (rtp_timestamp[1] - rtp_timestamp[0]) % RTP_TIMESTAMP_BIT_DEPTH) / 2))
-                return frame_rate_c
+                break
+    if len(rtp_timestamp) >= 3:
+        frame_rate_c = Decimal(RTP_CLOCK /
+            (( (rtp_timestamp[2] - rtp_timestamp[1]) % RTP_TIMESTAMP_BIT_DEPTH +
+                (rtp_timestamp[1] - rtp_timestamp[0]) % RTP_TIMESTAMP_BIT_DEPTH) / 2))
+        return frame_rate_c
     return None
 
+def timestamp_to_next_alignment_point(timestamp, tframe, leapseconds=37):
+    # find exact timing
+    framerate = 1/tframe
+    framerate_scalar = Decimal(1 if round(framerate, 0) == framerate else 1.001)
+    framerate = round(framerate, 0)
+
+    # Now find alignment point
+    time_tai = timestamp - leapseconds
+    frames = (time_tai * framerate) / framerate_scalar
+    frames = math.ceil(frames)
+    return ((frames * framerate_scalar) / framerate) + leapseconds
+
+def update_frame(frames, cur_tm, trs, npackets):
+    frame = frames[0]
+    drained_this_time = 0
+    if cur_tm > frame['drain_start_tm']:
+        frame['drained'] = math.ceil((cur_tm - frame['drain_start_tm'] + trs) / trs)
+        
+        drained_this_time = frame['drained'] - frame['drained_prev']
+
+        frame['packet_count'] -= drained_this_time
+        frame['drained_prev'] = frame['drained']
+
+    frame_finished = False
+    if frame['drained'] >= npackets:
+        # this frame is finished with
+        frames.popleft()
+        frame_finished = True
+
+    return drained_this_time, frame_finished
 
 def vrx(capture, trs, tframe, npackets):
     res = []
     tvd = 0
+    TROdefault = tframe * 43 / 1125
     prev = None  # previous packet
-    frame_idx = 0  # frame index
-    initial_tm = None  # first frame timestamp
     drained = 0
     drained_prev = 0
     vrx_prev = 0
     vrx_curr = 0
+    frames = deque()
     for pkt in capture:
         cur_tm = Decimal(pkt.sniff_timestamp)  # current timestamp
         if prev and hasattr(prev, 'rtp') and prev.rtp.marker == '1':  # new frame
-            if frame_idx == 0:  # first frame
-                # Should use each first packet as a Tvd
-                initial_tm = cur_tm
-            tvd = initial_tm + frame_idx * tframe
-            drained = drained_prev = 0
-            frame_idx += 1
+            frame_alignment_time = timestamp_to_next_alignment_point(cur_tm, tframe)
+            frames.append({
+                'drain_start_tm' : frame_alignment_time + TROdefault,
+                'drained' : 0,
+                'drained_prev' : 0,
+                'packet_count' : 0
+            })
 
-        if initial_tm:
+        if len(frames):
+            # increase vrx packet count
+            vrx_curr = vrx_prev + 1
+            # Add packet to the last stored frame
+            frames[-1]['packet_count'] += 1
 
-            # should not drain any more packet after time: Tvd + Npackets * Trs
-            # drained = int((cur_tm - initial_tm) / trs)
-            if (cur_tm - tvd) < (tvd + npackets * trs):
-                drained = math.ceil((cur_tm - tvd + trs) / trs)
+            drained_here, frame_finished = update_frame(frames, cur_tm, trs, npackets)
+            vrx_curr -= drained_here
 
-            vrx_curr = vrx_prev + 1 - (drained - drained_prev)
+            if frame_finished:
+                drained_here, _ = update_frame(frames, cur_tm, trs, npackets) # 2 frames can't finish back to back
+                vrx_curr -= drained_here
+
             if vrx_curr < 0:
                 print("VRX buffer underrun " + str(vrx_curr))
                 vrx_curr = 0
-
-            drained_prev = drained
 
         res.append(vrx_curr)
         vrx_prev = vrx_curr
